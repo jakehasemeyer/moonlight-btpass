@@ -47,5 +47,28 @@ int main() {
     memcpy(&sent_yaw, gyro_data.data() + 20 + 72, sizeof(sent_yaw));
     assert(std::abs(sent_yaw - 10.0f) < 0.1f);
     assert(gyro_data[22] == 2);
+
+    Pad ir_pad;
+    ir_pad.ir_enabled = true;
+    const uint8_t ir_report[] = {
+        0x37, 0, 0, 128, 154, 128,
+        0x90, 0x2c, 0x56, 0x58, 0x2c, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x7f, 0x7f, 0x7f, 0x7f, 0x7e, 0x7e,
+    };
+    apply_report(ir_pad, ir_report, sizeof(ir_report));
+    assert(ir_pad.ir_visible && ir_pad.ir_x == 131 && ir_pad.ir_y == 156);
+    auto ir_data = pad_data(0, ir_pad);
+    assert(ir_data[39] == 0 && ir_data[42] == 131 && ir_data[43] == 156);
+    uint8_t no_dots[sizeof(ir_report)];
+    memcpy(no_dots, ir_report, sizeof(no_dots));
+    memset(no_dots + 6, 0xff, 10);
+    apply_report(ir_pad, no_dots, sizeof(no_dots));
+    assert(!ir_pad.ir_visible && pad_data(0, ir_pad)[39] == 1);
+
+    Pad gyro_ir;
+    gyro_ir.motion_plus = true;
+    gyro_ir.ir_enabled = true;
+    for (int i = 0; i < 100; ++i) apply_report(gyro_ir, ir_report, sizeof(ir_report));
+    assert(gyro_ir.gyro_ready && gyro_ir.ir_visible);
     return 0;
 }

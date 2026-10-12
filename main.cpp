@@ -41,6 +41,10 @@ struct Pad {
     std::atomic<bool> motion_plus{false};
     std::atomic<bool> gyro_ready{false};
     std::atomic<bool> rumble{false};
+    bool ir_enabled = false;
+    std::atomic<bool> ir_visible{false};
+    uint8_t ir_x = 128;
+    uint8_t ir_y = 128;
     uint64_t motion_timestamp_us = 0;
     uint32_t sequence = 0;
     std::thread reader;
@@ -115,16 +119,39 @@ static void set_rumble(Pad& pad, bool enabled) {
     write_output(pad, bytes, sizeof(bytes));
 }
 
-static bool write_register(Pad& pad, uint32_t address, uint8_t value) {
+static bool write_register_block(Pad& pad, uint32_t address, const uint8_t* values, size_t count) {
+    if (count < 1 || count > 16) return false;
     uint8_t bytes[22]{};
     bytes[0] = 0x16;
     bytes[1] = static_cast<uint8_t>(0x04 | (pad.rumble ? 1 : 0));
     bytes[2] = static_cast<uint8_t>(address >> 16);
     bytes[3] = static_cast<uint8_t>(address >> 8);
     bytes[4] = static_cast<uint8_t>(address);
-    bytes[5] = 1;
-    bytes[6] = value;
+    bytes[5] = static_cast<uint8_t>(count);
+    memcpy(bytes + 6, values, count);
     return write_output(pad, bytes, sizeof(bytes));
+}
+
+static bool write_register(Pad& pad, uint32_t address, uint8_t value) {
+    return write_register_block(pad, address, &value, 1);
+}
+
+static bool start_ir(Pad& pad) {
+    const uint8_t enable1[] = {0x13, static_cast<uint8_t>(0x04 | (pad.rumble ? 1 : 0))};
+    const uint8_t enable2[] = {0x1a, static_cast<uint8_t>(0x04 | (pad.rumble ? 1 : 0))};
+    const uint8_t sensitivity1[] = {0x02, 0, 0, 0x71, 0x01, 0, 0xaa, 0, 0x64};
+    const uint8_t sensitivity2[] = {0x63, 0x03};
+    auto send = [](bool ok) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return ok;
+    };
+    return send(write_output(pad, enable1, sizeof(enable1))) &&
+           send(write_output(pad, enable2, sizeof(enable2))) &&
+           send(write_register(pad, 0xb00030, 0x08)) &&
+           send(write_register_block(pad, 0xb00000, sensitivity1, sizeof(sensitivity1))) &&
+           send(write_register_block(pad, 0xb0001a, sensitivity2, sizeof(sensitivity2))) &&
+           send(write_register(pad, 0xb00033, 0x01)) &&
+           send(write_register(pad, 0xb00030, 0x08));
 }
 
 static bool read_register(Pad& pad, uint32_t address, uint8_t* data, size_t length) {
@@ -183,7 +210,8 @@ static bool open_remote(Pad& pad, const Device& device) {
                identity[2] == 0xa4 && identity[3] == 0x20 && identity[5] == 0x05) {
         pad.motion_plus = true;
     }
-    if (!write_report(pad, 0x12, 0x04, pad.motion_plus ? 0x35 : 0x31)) {
+    pad.ir_enabled = start_ir(pad);
+    if (!write_report(pad, 0x12, 0x04, pad.ir_enabled ? 0x37 : (pad.motion_plus ? 0x35 : 0x31))) {
         CloseHandle(pad.handle);
         pad.handle = INVALID_HANDLE_VALUE;
         return false;
@@ -192,7 +220,8 @@ static bool open_remote(Pad& pad, const Device& device) {
 }
 
 static void apply_report(Pad& pad, const uint8_t* bytes, DWORD count) {
-    if (count < 3 || (bytes[0] != 0x30 && bytes[0] != 0x31 && bytes[0] != 0x35)) return;
+    if (count < 3 || (bytes[0] != 0x30 && bytes[0] != 0x31 &&
+                      bytes[0] != 0x35 && bytes[0] != 0x37)) return;
     const uint8_t a = bytes[1], b = bytes[2];
     std::lock_guard<std::mutex> lock(pad.mutex);
     pad.buttons1 = (a & 0x01 ? 0x80 : 0) | (a & 0x04 ? 0x40 : 0) |
@@ -201,14 +230,40 @@ static void apply_report(Pad& pad, const uint8_t* bytes, DWORD count) {
     pad.buttons2 = (b & 0x08 ? 0x20 : 0) | (b & 0x04 ? 0x40 : 0) |
                    (b & 0x02 ? 0x80 : 0) | (b & 0x01 ? 0x10 : 0);
     pad.home = (b & 0x80) != 0;
-    if (count >= 6 && (bytes[0] == 0x31 || bytes[0] == 0x35)) {
+    if (count >= 6 && (bytes[0] == 0x31 || bytes[0] == 0x35 || bytes[0] == 0x37)) {
         // ponytail: use nominal calibration first; read EEPROM calibration if hardware tests show drift.
         for (int i = 0; i < 3; ++i) pad.accel[i] = (static_cast<int>(bytes[3 + i]) - 128) / 26.0f;
         pad.motion_timestamp_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     }
-    if (pad.motion_plus && count >= 12 && bytes[0] == 0x35 && (bytes[11] & 0x02)) {
-        const uint8_t* extension = bytes + 6;
+    if (bytes[0] == 0x37 && count >= 22) {
+        const uint8_t* ir = bytes + 6;
+        int x[4], y[4];
+        for (int pair = 0; pair < 2; ++pair) {
+            const uint8_t* dots = ir + 5 * pair;
+            x[2 * pair] = dots[0] | ((dots[2] >> 4) & 3) << 8;
+            y[2 * pair] = dots[1] | ((dots[2] >> 6) & 3) << 8;
+            x[2 * pair + 1] = dots[3] | (dots[2] & 3) << 8;
+            y[2 * pair + 1] = dots[4] | ((dots[2] >> 2) & 3) << 8;
+        }
+        int first = -1, second = -1, separation = 20 * 20;
+        for (int i = 0; i < 4; ++i) {
+            if (x[i] == 1023 || y[i] == 1023) continue;
+            for (int j = i + 1; j < 4; ++j) {
+                if (x[j] == 1023 || y[j] == 1023) continue;
+                int distance = (x[i] - x[j]) * (x[i] - x[j]) + (y[i] - y[j]) * (y[i] - y[j]);
+                if (distance > separation) first = i, second = j, separation = distance;
+            }
+        }
+        pad.ir_visible = first >= 0;
+        if (pad.ir_visible) {
+            pad.ir_x = static_cast<uint8_t>(std::clamp(255 - (x[first] + x[second]) * 255 / 2046, 0, 255));
+            pad.ir_y = static_cast<uint8_t>(std::clamp(255 - (y[first] + y[second]) * 255 / 1534, 0, 255));
+        }
+    }
+    const uint8_t* extension = bytes[0] == 0x37 && count >= 22 ? bytes + 16 : bytes + 6;
+    if (pad.motion_plus && ((bytes[0] == 0x35 && count >= 12) ||
+                            (bytes[0] == 0x37 && count >= 22)) && (extension[5] & 0x02)) {
         const int raw[] = {
             extension[2] | (extension[5] & 0xfc) << 6,
             extension[0] | (extension[3] & 0xfc) << 6,
@@ -251,7 +306,7 @@ static void read_remote(Pad& pad) {
         CloseHandle(operation.hEvent);
         if (!ok) break;
         if (count >= 3 && bytes[0] == 0x20) {
-            write_report(pad, 0x12, 0x04, pad.motion_plus ? 0x35 : 0x31);
+            write_report(pad, 0x12, 0x04, pad.ir_enabled ? 0x37 : (pad.motion_plus ? 0x35 : 0x31));
             continue;
         }
         apply_report(pad, bytes.data(), count);
@@ -262,6 +317,7 @@ static void read_remote(Pad& pad) {
     pad.accel[0] = pad.accel[1] = pad.accel[2] = 0;
     pad.gyro[0] = pad.gyro[1] = pad.gyro[2] = 0;
     pad.gyro_ready = false;
+    pad.ir_visible = false;
     pad.motion_timestamp_us = 0;
     ++pad.sequence;
 }
@@ -339,7 +395,10 @@ static std::vector<uint8_t> pad_data(int slot, Pad& pad) {
     p[16] = pad.buttons1;
     p[17] = pad.buttons2;
     p[18] = pad.home;
-    p[20] = p[21] = p[22] = p[23] = 128;
+    p[19] = pad.ir_enabled && !pad.ir_visible;
+    p[20] = p[21] = 128;
+    p[22] = pad.ir_x;
+    p[23] = pad.ir_y;
     for (int i = 0; i < 4; ++i) p[24 + i] = (pad.buttons1 & (0x80 >> i)) ? 255 : 0;
     p[28] = pad.buttons2 & 0x80 ? 255 : 0;
     p[29] = pad.buttons2 & 0x40 ? 255 : 0;
